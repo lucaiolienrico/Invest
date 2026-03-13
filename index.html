@@ -998,7 +998,8 @@
                     document.getElementById('stat-investment').textContent=app.formatCurrency(equity);
                     if(app.state.get('isPro')) app.chart.update();
                     app.state.saveDraft();
-                    app.ui.updateDailyCounter();
+                    // FIX: non chiamare updateDailyCounter() qui senza argomento —
+                    // il badge viene aggiornato correttamente dentro checkDailyLimit()
                 },
                 updateRental(equity, mp) {
                     const adr=app.calc.getVal('adr'), occ=app.calc.getVal('occupancy');
@@ -1454,21 +1455,25 @@
                         if(!adminSnap.exists) return;
                     } catch(e) { return; }
                     try {
-                        const usersSnap=await app.db.collection('users').orderBy('joined','desc').limit(200).get();
-                        let proCount=0;
-                        const rows=[];
-                        usersSnap.forEach(doc=>{
-                            const d=doc.data();
-                            if(d.plan==='pro') proCount++;
-                            const date=d.joined?.toDate?d.joined.toDate().toLocaleDateString('it-IT'):'N/A';
+                        // FIX ADMIN QUERY: rimosso orderBy('joined') che richiedeva un indice composito
+                        // non ancora creato su Firestore → causa errore "failed-precondition".
+                        // Rimosso anche .count() non supportato dalla SDK compat v9 → usa .size
+                        const usersSnap = await app.db.collection('users').limit(200).get();
+                        let proCount = 0;
+                        const rows = [];
+                        usersSnap.forEach(doc => {
+                            const d = doc.data();
+                            if(d.plan === 'pro') proCount++;
+                            const date = d.joined?.toDate ? d.joined.toDate().toLocaleDateString('it-IT') : 'N/A';
                             // SECURITY FIX C2: tutti i valori da Firestore passano per esc()
                             rows.push(`<tr><td>${esc(d.email||'—')}</td><td><span class="user-plan ${d.plan==='pro'?'pro':'free'}">${esc((d.plan||'free').toUpperCase())}</span></td><td>${esc(date)}</td></tr>`);
                         });
-                        const projSnap=await app.db.collection('projects').count().get();
-                        document.getElementById('admin-users-count').textContent=usersSnap.size;
-                        document.getElementById('admin-pro-count').textContent=proCount;
-                        document.getElementById('admin-projects-count').textContent=projSnap.data().count;
-                        document.getElementById('admin-users-list').innerHTML=rows.join('');
+                        // FIX: usa .size invece di .count().get() (non supportato in compat SDK)
+                        const projSnap = await app.db.collection('projects').limit(500).get();
+                        document.getElementById('admin-users-count').textContent = usersSnap.size;
+                        document.getElementById('admin-pro-count').textContent = proCount;
+                        document.getElementById('admin-projects-count').textContent = projSnap.size;
+                        document.getElementById('admin-users-list').innerHTML = rows.join('');
                     } catch(e){ console.error(e); app.toast.show('Errore caricamento dati admin','error'); }
                 }
             },
