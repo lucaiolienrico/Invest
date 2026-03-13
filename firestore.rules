@@ -1,0 +1,145 @@
+// ============================================================
+//  InvestPro — Firestore Security Rules
+//  Versione: 2.1.0-secure
+//
+//  COME APPLICARE:
+//  1. Firebase Console → Firestore → Regole → incolla queste regole
+//  2. Oppure: firebase deploy --only firestore:rules
+//
+//  COME AGGIUNGERE UN ADMIN:
+//  Firebase Console → Firestore → crea documento:
+//  Percorso: admins/{TUO_UID_FIREBASE}
+//  Campi: { createdAt: <timestamp>, email: "tua@email.com" }
+//  Nessun client può scrivere in 'admins', solo tu dalla Console.
+// ============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ──────────────────────────────────────
+
+    // Utente autenticato
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    // L'utente sta accedendo al proprio documento
+    function isOwner(uid) {
+      return isAuth() && request.auth.uid == uid;
+    }
+
+    // Verifica admin: la collection 'admins' è scrivibile SOLO dalla Firebase Console
+    // (nessuna regola allow write → nessun client può scrivere).
+    // SECURITY FIX C1: isAdmin() legge il documento reale, non una email in CONFIG.
+    function isAdmin() {
+      return isAuth() &&
+             exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // Impedisce di modificare campi sensibili lato client
+    // SECURITY FIX B1: 'plan', 'isPro', 'joined' non sono scrivibili dai client
+    function notTouchingSensitiveFields() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+               .hasAny(['plan', 'isPro', 'joined', 'version']);
+    }
+
+    // ── collection: admins ────────────────────────────────────
+    // SECURITY FIX C1: nessun client può leggere la lista di tutti gli admin.
+    // Un client può solo verificare se il PROPRIO uid è admin (usato da isAdmin()).
+    match /admins/{uid} {
+      allow read: if isOwner(uid);
+      allow write: if false; // SOLO Firebase Console / Admin SDK
+    }
+
+    // ── collection: users ─────────────────────────────────────
+    match /users/{uid} {
+      // Lettura: ogni utente legge solo il proprio doc; l'admin li legge tutti
+      allow get:  if isOwner(uid) || isAdmin();
+      allow list: if isAdmin(); // SECURITY FIX C1: solo admin fa GET /users (pannello admin)
+
+      // Creazione: l'utente può creare solo il proprio doc, senza campi riservati
+      allow create: if isOwner(uid)
+                    && !request.resource.data.keys().hasAny(['plan', 'isPro']);
+
+      // Aggiornamento: l'utente può aggiornare SOLO i campi non sensibili e dailyOps
+      // SECURITY FIX B1: 'plan' non è mai scrivibile dal client
+      // SECURITY FIX A1: dailyOps.count può solo incrementare di 1 per volta
+      allow update: if isOwner(uid)
+                    && notTouchingSensitiveFields()
+                    && (
+                         // Permette aggiornamento di dailyOps con incremento di 1
+                         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['dailyOps'])
+                         ||
+                         (
+                           request.resource.data.dailyOps.date is string
+                           && request.resource.data.dailyOps.count is int
+                           && (
+                             // Reset per nuovo giorno: count deve essere 1
+                             (resource.data.dailyOps == null
+                              || resource.data.dailyOps.date != request.resource.data.dailyOps.date)
+                             ? request.resource.data.dailyOps.count == 1
+                             // Stesso giorno: può solo incrementare di 1
+                             : request.resource.data.dailyOps.count == resource.data.dailyOps.count + 1
+           )
+                         )
+                       );
+    }
+
+    // ── collection: projects ──────────────────────────────────
+    match /projects/{projectId} {
+      // Lettura: solo il proprietario o l'admin
+      allow read: if isAuth() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow list: if isAuth(); // filtrato dalla query lato client con where('uid','==',user.uid)
+
+      // Creazione: solo per sé stessi, con uid corretto
+      allow create: if isAuth()
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.keys().hasAll(['uid', 'name', 'mode', 'inputs']);
+
+      // Modifica: solo il proprietario
+      allow update: if isAuth()
+                    && resource.data.uid == request.auth.uid
+                    && request.resource.data.uid == request.auth.uid;
+
+      // Eliminazione: proprietario o admin
+      allow delete: if isAuth()
+                    && (resource.data.uid == request.auth.uid || isAdmin());
+    }
+
+    // ── collection: customers (Stripe Extension) ──────────────
+    match /customers/{uid} {
+      allow read: if isOwner(uid);
+      allow write: if false; // SOLO Stripe Extension via Admin SDK
+
+      // checkout_sessions: il client scrive per avviare il checkout
+      match /checkout_sessions/{sessionId} {
+        allow read:   if isOwner(uid);
+        allow create: if isOwner(uid)
+                      && request.resource.data.keys().hasAll(['price', 'success_url', 'cancel_url']);
+        allow update: if false; // SOLO Stripe Extension
+        allow delete: if false;
+      }
+
+      // subscriptions: SECURITY FIX B2: solo lettura, mai scrittura client
+      match /subscriptions/{subscriptionId} {
+        allow read:  if isOwner(uid);
+        allow write: if false; // SOLO Stripe Extension via Admin SDK
+      }
+
+      // payments: SECURITY FIX B2: solo lettura, mai scrittura client
+      // Impedisce la creazione di pagamenti finti per ottenere status PRO
+      match /payments/{paymentId} {
+        allow read:  if isOwner(uid);
+        allow write: if false; // SOLO Stripe Extension via Admin SDK
+      }
+    }
+
+    // ── Blocco di default (deny-all) ──────────────────────────
+    // Qualsiasi collection non esplicitamente elencata è inaccessibile.
+    // Principio: deny by default, allow by exception.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
