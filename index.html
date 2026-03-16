@@ -698,7 +698,8 @@
                     app.geo.setupSearch();
                     app.loadSavedInputs();
                     app.mode.set(app.state.get('mode'), false);
-                    app.calc.update();
+                    // skipLimit=true: render iniziale, non conta come operazione utente
+                    app.calc.update(true);
                     app.attachEventListeners();
                     app.setupAutoSave();
                     setTimeout(()=>document.getElementById('app-loader').classList.add('hidden'), 600);
@@ -893,6 +894,8 @@
                             document.querySelectorAll('.admin-only').forEach(el=>el.style.display=isAdmin?'flex':'none');
                             app.updateAuthUI(user);
                             app.upgrade.updatePaymentUI();
+                            // Ricalcola con stato auth definitivo (isPro e user ora corretti)
+                            app.calc.update(true);
 
                             // Aggiorna badge contatore con valore da Firestore
                             if(!isPro) {
@@ -997,9 +1000,11 @@
                     btn.classList.add('active');
                     app.calc.update();
                 },
-                async update() {
+                async update(skipLimit = false) {
                     // SECURITY FIX A1: await obbligatorio — checkDailyLimit è ora asincrona (Firestore)
-                    if (!await app.access.checkDailyLimit()) return;
+                    // skipLimit=true solo durante il render iniziale al caricamento pagina:
+                    // l'utente non ha ancora interagito, non va conteggiata come operazione.
+                    if (!skipLimit && !await app.access.checkDailyLimit()) return;
 
                     const mode=app.state.get('mode');
                     const price=app.calc.getVal('price'), reno=app.calc.getVal('reno'), closing=app.calc.getVal('closing');
@@ -1517,6 +1522,7 @@
                 // La Security Rule su Firestore impedisce di decrementare o impostare valori arbitrari.
                 async checkDailyLimit() {
                     if(app.state.get('isPro')) return true;
+                    if(app.state.get('isAdmin')) return true; // admin: nessun limite
                     const user = app.state.get('user');
                     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD, timezone-agnostic
 
