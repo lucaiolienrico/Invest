@@ -855,6 +855,22 @@
                                 // NON scriviamo mai plan:'pro' dal client — rimosso FIX B1
                             } catch(e){ console.error('User doc error:', e); }
 
+                            // FIX STRIPE: la Extension crea customers/{uid} solo al momento
+                            // della registrazione via auth.onCreate(). Per utenti pre-esistenti
+                            // (o se il trigger non è scattato) il documento potrebbe non esistere,
+                            // causando l'errore "Cannot read properties of null (reading 'stripeId')".
+                            // Garantiamo che customers/{uid} esista sempre prima del checkout.
+                            try {
+                                const custSnap = await app.db.collection('customers').doc(user.uid).get();
+                                if(!custSnap.exists) {
+                                    // Creiamo il documento con solo l'email: la Extension
+                                    // lo completerà con stripeId alla prima sessione di checkout
+                                    await app.db.collection('customers').doc(user.uid).set({
+                                        email: user.email
+                                    });
+                                }
+                            } catch(e){ console.warn('Customers doc check failed:', e); }
+
                             app.ui.setProStatus(isPro);
 
                             // SECURITY FIX C1: admin check via Firestore, NON via email in CONFIG.
@@ -998,8 +1014,7 @@
                     document.getElementById('stat-investment').textContent=app.formatCurrency(equity);
                     if(app.state.get('isPro')) app.chart.update();
                     app.state.saveDraft();
-                    // FIX: non chiamare updateDailyCounter() qui senza argomento —
-                    // il badge viene aggiornato correttamente dentro checkDailyLimit()
+                    // FIX: updateDailyCounter() aggiornato correttamente dentro checkDailyLimit()
                 },
                 updateRental(equity, mp) {
                     const adr=app.calc.getVal('adr'), occ=app.calc.getVal('occupancy');
@@ -1468,7 +1483,7 @@
                             // SECURITY FIX C2: tutti i valori da Firestore passano per esc()
                             rows.push(`<tr><td>${esc(d.email||'—')}</td><td><span class="user-plan ${d.plan==='pro'?'pro':'free'}">${esc((d.plan||'free').toUpperCase())}</span></td><td>${esc(date)}</td></tr>`);
                         });
-                        // FIX: usa .size invece di .count().get() (non supportato in compat SDK)
+                        // FIX: usa .size invece di .count().get() (non supportato in compat SDK v9)
                         const projSnap = await app.db.collection('projects').limit(500).get();
                         document.getElementById('admin-users-count').textContent = usersSnap.size;
                         document.getElementById('admin-pro-count').textContent = proCount;
