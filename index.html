@@ -855,23 +855,23 @@
                                 // NON scriviamo mai plan:'pro' dal client — rimosso FIX B1
                             } catch(e){ console.error('User doc error:', e); }
 
-                            // FIX STRIPE: la Extension crea customers/{uid} solo al momento
-                            // della registrazione via auth.onCreate(). Per utenti pre-esistenti
-                            // (o se il trigger non è scattato) il documento potrebbe non esistere,
+                            // FIX STRIPE: la Extension crea customers/{uid} tramite auth.onCreate().
+                            // Per utenti pre-esistenti il documento potrebbe non esistere,
                             // causando l'errore "Cannot read properties of null (reading 'stripeId')".
                             // Garantiamo che customers/{uid} esista sempre prima del checkout.
                             try {
                                 const custSnap = await app.db.collection('customers').doc(user.uid).get();
                                 if(!custSnap.exists) {
-                                    // Creiamo il documento con solo l'email: la Extension
-                                    // lo completerà con stripeId alla prima sessione di checkout
                                     await app.db.collection('customers').doc(user.uid).set({
                                         email: user.email
                                     });
+                                    console.log('customers doc creato per:', user.email);
+                                } else {
+                                    console.log('customers doc presente per:', user.email);
                                 }
-                            } catch(e){ console.warn('Customers doc check failed:', e); }
-
-                            app.ui.setProStatus(isPro);
+                            } catch(e){
+                                console.error('Customers doc error — verifica Security Rules:', e.code, e.message);
+                            }
 
                             // SECURITY FIX C1: admin check via Firestore, NON via email in CONFIG.
                             // La collection 'admins' ha Security Rules che impediscono scritture client.
@@ -881,6 +881,13 @@
                                 const adminSnap = await app.db.collection('admins').doc(user.uid).get();
                                 isAdmin = adminSnap.exists;
                             } catch(e){ console.warn('Admin check failed:', e); }
+
+                            // FIX OWNER PRO: l'admin/proprietario ha sempre accesso PRO gratuito.
+                            // Non ha senso che il proprietario dell'app debba pagare per usarla.
+                            if(isAdmin) isPro = true;
+
+                            // Applica stato PRO all'UI ora che sia isPro che isAdmin sono definitivi
+                            app.ui.setProStatus(isPro);
 
                             app.state.set('isAdmin', isAdmin);
                             document.querySelectorAll('.admin-only').forEach(el=>el.style.display=isAdmin?'flex':'none');
