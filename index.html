@@ -11,7 +11,7 @@
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js" defer></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js" defer></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js" defer></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
     <!-- SheetJS: generazione .xlsx nativa (non CSV mascherato) -->
@@ -675,7 +675,9 @@
                 try { const s=JSON.parse(localStorage.getItem('investpro_state')||'{}'); this.state.theme=s.theme||'dark'; this.state.mode=s.mode||'rent'; this.state.projectName=s.projectName||'Nuova Analisi'; this.state.inputs=s.inputs||{}; } catch(e){}
             }
             saveDraft() {
-                const inp={}; document.querySelectorAll('input[id]').forEach(el=>{inp[el.id]=el.value;}); this.set('inputs',inp);
+                // LOW-02 FIX: escludere campi readonly calcolati dal draft locale
+                const READONLY_INPUTS=new Set(['mortgage-payment','equity-required']);
+                const inp={}; document.querySelectorAll('input[id]').forEach(el=>{ if(el.id && !READONLY_INPUTS.has(el.id)) inp[el.id]=el.value; }); this.set('inputs',inp);
             }
         }
 
@@ -770,6 +772,9 @@
             debounce(fn, delay) { let t; return(...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),delay); }; },
             formatCurrency(v) { return new Intl.NumberFormat('it-IT',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(v); },
             formatPercent(v) { return new Intl.NumberFormat('it-IT',{style:'percent',minimumFractionDigits:2,maximumFractionDigits:2}).format(v/100); },
+            // CRIT-05/06 FIX: sanitizzazione HTML centralizzata.
+            // Usare SEMPRE questa funzione prima di inserire dati utente in innerHTML.
+            escHtml(s) { return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;'); },
 
             toggleTheme() {
                 const next = app.state.get('theme')==='dark'?'light':'dark';
@@ -839,40 +844,28 @@
                             }
 
                             // Crea doc utente in Firestore SE non esiste.
-                            // SECURITY FIX B1: NON aggiorniamo mai il campo 'plan' dal client.
-                            // Il campo 'plan' è scritto ESCLUSIVAMENTE dalla Stripe Firebase Extension
-                            // via Admin SDK. La Security Rule vieta update del campo 'plan' ai client.
+                            // CRIT-03 FIX: 'plan' e 'version' RIMOSSI dal payload di create.
+                            // La Security Rule blocca esplicitamente create con 'plan' o 'isPro'.
+                            // 'version' è bloccato da notTouchingSensitiveFields() in update.
+                            // La Stripe Extension aggiornerà 'plan' via Admin SDK dopo il pagamento.
                             try {
                                 const docSnap=await app.db.collection('users').doc(user.uid).get();
                                 if(!docSnap.exists) {
-                                    // Prima registrazione: creiamo il doc senza impostare 'plan' manualmente
                                     await app.db.collection('users').doc(user.uid).set({
                                         email: user.email,
-                                        plan: 'free', // valore iniziale sicuro; la Extension lo aggiorna
-                                        joined: firebase.firestore.FieldValue.serverTimestamp(),
-                                        version: CONFIG.version
+                                        joined: firebase.firestore.FieldValue.serverTimestamp()
                                     });
                                 }
-                                // NON scriviamo mai plan:'pro' dal client — rimosso FIX B1
-                            } catch(e){ console.error('User doc error:', e); }
+                            } catch(e){ console.error('User doc create error:', e.code, e.message); }
 
-                            // FIX STRIPE: la Extension crea customers/{uid} tramite auth.onCreate().
-                            // Per utenti pre-esistenti il documento potrebbe non esistere,
-                            // causando l'errore "Cannot read properties of null (reading 'stripeId')".
-                            // Garantiamo che customers/{uid} esista sempre prima del checkout.
-                            try {
-                                const custSnap = await app.db.collection('customers').doc(user.uid).get();
-                                if(!custSnap.exists) {
-                                    await app.db.collection('customers').doc(user.uid).set({
-                                        email: user.email
-                                    });
-                                    console.log('customers doc creato per:', user.email);
-                                } else {
-                                    console.log('customers doc presente per:', user.email);
-                                }
-                            } catch(e){
-                                console.error('Customers doc error — verifica Security Rules:', e.code, e.message);
-                            }
+                            // CRIT-04 NOTE: la Security Rule 'customers/{uid}' ha 'allow write: if false'
+                            // che blocca qualsiasi scrittura client — inclusa la creazione iniziale.
+                            // Per utenti pre-esistenti alla Stripe Extension, applicare questo fix
+                            // nelle firestore.rules:
+                            //   allow create: if isOwner(uid)
+                            //                 && request.resource.data.keys().hasAll(['email'])
+                            //                 && request.resource.data.keys().hasOnly(['email']);
+                            // La scrittura client è stata rimossa da qui per evitare errori silenti ad ogni login.
 
                             // SECURITY FIX C1: admin check via Firestore, NON via email in CONFIG.
                             // La collection 'admins' ha Security Rules che impediscono scritture client.
@@ -904,6 +897,9 @@
                                     const uSnap = await app.db.collection('users').doc(user.uid).get();
                                     const ops = uSnap.data()?.dailyOps || {};
                                     const count = ops.date === today ? (ops.count || 0) : 0;
+                                    // Inizializza la cache del contatore con il valore reale da Firestore.
+                                    // Così il primo input dell'utente usa già il valore corretto senza round-trip.
+                                    app.access._dailyCount = { date: today, count: count };
                                     app.ui.updateDailyCounter(count);
                                 } catch(e){ app.ui.updateDailyCounter(0); }
                             }
@@ -913,6 +909,7 @@
                             document.querySelectorAll('.admin-only').forEach(el=>el.style.display='none');
                             app.updateAuthUI(null);
                             app.upgrade.updatePaymentUI();
+                            app.access._dailyCount = null; // reset cache al logout
                             app.ui.updateDailyCounter(0);
                         }
                     });
@@ -933,12 +930,22 @@
                 const c=document.getElementById('auth-container');
                 if(!c) return;
                 if(user) {
+                    // CRIT-06 FIX: displayName e photoURL sono dati user-controlled (impostabili
+                    // dall'account Google dell'utente). Sanificare prima dell'inserimento in innerHTML.
+                    // photoURL: whitelist HTTPS + domini Google affidabili per prevenire javascript: URI.
+                    const safePhoto = user.photoURL &&
+                        /^https:\/\/(lh[0-9]+\.googleusercontent\.com|avatars\.githubusercontent\.com)/.test(user.photoURL)
+                        ? user.photoURL : null;
+                    const avatarContent = safePhoto
+                        ? `<img src="${app.escHtml(safePhoto)}" alt="">`
+                        : app.escHtml((user.email??'?').charAt(0).toUpperCase());
+                    const isPro = app.state.get('isPro');
                     c.innerHTML=`
                         <div class="user-info">
-                            <div class="user-avatar">${user.photoURL?`<img src="${user.photoURL}" alt="">`:user.email?.charAt(0).toUpperCase()}</div>
+                            <div class="user-avatar">${avatarContent}</div>
                             <div class="user-details">
-                                <div class="user-name">${user.displayName||user.email}</div>
-                                <div class="user-plan ${app.state.get('isPro')?'pro':'free'}">${app.state.get('isPro')?'PRO ✦':'FREE'}</div>
+                                <div class="user-name">${app.escHtml(user.displayName||user.email)}</div>
+                                <div class="user-plan ${isPro?'pro':'free'}">${isPro?'PRO ✦':'FREE'}</div>
                             </div>
                         </div>
                         <button class="header-btn" style="width:100%;justify-content:center;border-color:var(--danger);color:var(--danger);" id="logout-btn"><i class="fa-solid fa-sign-out-alt"></i><span>Logout</span></button>`;
@@ -977,9 +984,21 @@
                         const q=inp.value.toLowerCase().trim();
                         if(q.length<2){dd.classList.remove('active');return;}
                         const m=CITY_DB.filter(c=>c.name.toLowerCase().includes(q)||c.region.toLowerCase().includes(q)).slice(0,6);
-                        if(m.length){ dd.innerHTML=m.map(c=>`<div class="city-item" onclick="app.geo.selectCity('${c.name}',${c.touristTax})"><div><div class="city-name">${c.name}</div><div class="city-region">${c.region}</div></div><div class="city-tax">€${c.touristTax}/notte</div></div>`).join(''); dd.classList.add('active'); }
-                        else dd.classList.remove('active');
+                        if(m.length){
+                            // LOW-01 FIX: data-attribute invece di onclick inline.
+                            // 'app' vive dentro un IIFE e non è globale — l'onclick inline
+                            // causerebbe ReferenceError: app is not defined al click.
+                            // Event delegation sul container risolve il problema senza toccare lo scope.
+                            dd.innerHTML=m.map(c=>`<div class="city-item" data-name="${app.escHtml(c.name)}" data-tax="${c.touristTax}"><div><div class="city-name">${app.escHtml(c.name)}</div><div class="city-region">${app.escHtml(c.region)}</div></div><div class="city-tax">€${c.touristTax}/notte</div></div>`).join('');
+                            dd.classList.add('active');
+                        } else dd.classList.remove('active');
                     }, 200));
+                    // Un solo listener delegato sul dropdown — nessun handler per item
+                    dd.addEventListener('click', e=>{
+                        const item=e.target.closest('.city-item');
+                        if(!item) return;
+                        app.geo.selectCity(item.dataset.name, parseFloat(item.dataset.tax));
+                    });
                     document.addEventListener('click', e=>{ if(!inp.contains(e.target)&&!dd.contains(e.target)) dd.classList.remove('active'); });
                 },
                 selectCity(name, tax) {
@@ -1029,6 +1048,11 @@
                     // FIX: updateDailyCounter() aggiornato correttamente dentro checkDailyLimit()
                 },
                 updateRental(equity, mp) {
+                    // Aritmetica nativa JS per i KPI a singolo passaggio.
+                    // Decimal.js è riservato a showAmortization() e updateProjection() dove
+                    // le 360 iterazioni accumulano errori fino a ±€12 (cfr. .md §2.1).
+                    // Per un calcolo lineare come questo, la differenza IEEE 754 è < €0.01
+                    // su qualsiasi importo realistico — non percettibile nella visualizzazione.
                     const adr=app.calc.getVal('adr'), occ=app.calc.getVal('occupancy');
                     const taxR=app.calc.getVal('tax-rate'), ota=app.calc.getVal('ota-fee');
                     const fc=app.calc.getVal('fixed-costs'), vc=app.calc.getVal('var-costs');
@@ -1057,7 +1081,6 @@
                     document.getElementById('kpi-nightly').textContent=app.formatCurrency(nProfit);
                     document.getElementById('stat-roi').textContent=coc.toFixed(2)+'%';
                     document.getElementById('stat-cashflow').textContent=app.formatCurrency(mCashflow);
-                    // FIX: break-even mostra "Mai" se cashflow negativo
                     document.getElementById('stat-breakeven').textContent=be?be.toFixed(1)+' anni':'Mai';
                     app.calc.updateSensitivity(adr,taxR,ota,fc,vc,maint,vac,mp);
                     app.state.set('calculations',{grossRevenue:grossRev,otaCosts:otaCost,taxes,operatingCosts:totalOp-otaCost,mortgageAnnual:mortAnn,netIncome:netInc});
@@ -1211,9 +1234,13 @@
                     if(!user){ app.toast.show('Devi effettuare il login per salvare','warning'); return; }
                     const name=document.getElementById('project-name').value||'Nuovo Progetto';
                     const inputs={};
-                    document.querySelectorAll('input[id]').forEach(el=>{ if(el.id) inputs[el.id]=el.value; });
+                    // LOW-02 FIX: escludere campi readonly calcolati (mortgage-payment, equity-required).
+                    // Questi valori sono derivati dagli input — salvarli crea snapshot inconsistenti
+                    // se un progetto viene caricato e i parametri cambiano prima del ricalcolo.
+                    const READONLY_INPUTS=new Set(['mortgage-payment','equity-required']);
+                    document.querySelectorAll('input[id]').forEach(el=>{ if(el.id && !READONLY_INPUTS.has(el.id)) inputs[el.id]=el.value; });
                     try {
-                        await app.db.collection('projects').add({ uid:user.uid, name, mode:app.state.get('mode'), inputs, updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
+                        await app.db.collection('projects').add({ uid:user.uid, name, mode:app.state.get('mode'), inputs, createdAt:firebase.firestore.FieldValue.serverTimestamp(), updatedAt:firebase.firestore.FieldValue.serverTimestamp() });
                         app.state.set('projectName', name);
                         app.toast.show('Progetto salvato!', 'success');
                     } catch(e){ console.error(e); app.toast.show('Errore durante il salvataggio','error'); }
@@ -1226,8 +1253,13 @@
                     lc.innerHTML='<div class="empty-state"><div class="skeleton" style="height:60px;margin-bottom:10px;"></div><div class="skeleton" style="height:60px;"></div></div>';
                     try {
                         const isAdmin=app.state.get('isAdmin');
-                        let q=app.db.collection('projects').orderBy('updatedAt','desc');
-                        if(!isAdmin) q=q.where('uid','==',user.uid);
+                        // where() prima di orderBy() è obbligatorio per query composte in Firestore.
+                        // L'ordine inverso causa 'failed-precondition' anche con l'indice corretto.
+                        // INDICE COMPOSITO RICHIESTO: projects | uid ASC + updatedAt DESC
+                        // Crearlo in Firebase Console → Firestore → Indici → Aggiungi indice composito.
+                        let q = isAdmin
+                            ? app.db.collection('projects').orderBy('updatedAt','desc')
+                            : app.db.collection('projects').where('uid','==',user.uid).orderBy('updatedAt','desc');
                         const snap=await q.get();
                         if(snap.empty){ lc.innerHTML='<div class="empty-state"><i class="fa-solid fa-folder-open"></i><p>Nessun progetto salvato</p></div>'; return; }
                         lc.innerHTML='';
@@ -1236,7 +1268,14 @@
                             const date=d.updatedAt?.toDate?d.updatedAt.toDate().toLocaleDateString('it-IT'):'N/A';
                             const item=document.createElement('div');
                             item.className='project-item';
-                            item.innerHTML=`<div class="project-info"><span class="project-name">${d.name}</span><div class="project-meta"><span><i class="fa-solid ${d.mode==='rent'?'fa-house-chimney':'fa-hammer'}"></i> ${d.mode==='rent'?'Messa a Reddito':'Trading'}</span><span>${date}</span></div></div><div class="project-actions"><button class="btn-icon" title="Carica"><i class="fa-solid fa-folder-open"></i></button><button class="btn-icon danger" title="Elimina"><i class="fa-solid fa-trash"></i></button></div>`;
+                            // CRIT-05 FIX: d.name è dato user-controlled da Firestore.
+                            // Senza escaping, un payload come <img src=x onerror=fetch(...)>
+                            // nel nome del progetto diventa XSS persistente visibile all'admin.
+                            const safeName = app.escHtml(d.name);
+                            const safeMode = d.mode==='rent' ? 'Messa a Reddito' : 'Trading'; // enum controllato
+                            const safeDate = app.escHtml(date);
+                            const modeIcon = d.mode==='rent' ? 'fa-house-chimney' : 'fa-hammer';
+                            item.innerHTML=`<div class="project-info"><span class="project-name">${safeName}</span><div class="project-meta"><span><i class="fa-solid ${modeIcon}"></i> ${safeMode}</span><span>${safeDate}</span></div></div><div class="project-actions"><button class="btn-icon" title="Carica"><i class="fa-solid fa-folder-open"></i></button><button class="btn-icon danger" title="Elimina"><i class="fa-solid fa-trash"></i></button></div>`;
                             lc.appendChild(item);
                             item.querySelector('.btn-icon:not(.danger)').addEventListener('click', e=>{e.stopPropagation();app.deals.load(doc.id);});
                             item.querySelector('.btn-icon.danger').addEventListener('click', e=>{e.stopPropagation();app.deals.delete(doc.id);});
@@ -1484,23 +1523,29 @@
                     try {
                         // FIX ADMIN QUERY: rimosso orderBy('joined') che richiedeva un indice composito
                         // non ancora creato su Firestore → causa errore "failed-precondition".
-                        // Rimosso anche .count() non supportato dalla SDK compat v9 → usa .size
-                        const usersSnap = await app.db.collection('users').limit(200).get();
+                        // LOW-03 FIX: limit(201) invece di limit(200) per rilevare il troncamento.
+                        // Se il risultato supera 200, mostriamo "200+" e un avviso all'admin.
+                        const MAX_USERS = 200;
+                        const usersSnap = await app.db.collection('users').limit(MAX_USERS + 1).get();
+                        const truncated = usersSnap.size > MAX_USERS;
                         let proCount = 0;
                         const rows = [];
+                        let docCount = 0;
                         usersSnap.forEach(doc => {
+                            if(docCount >= MAX_USERS) return; // salta l'eventuale 201° record (solo sentinella)
+                            docCount++;
                             const d = doc.data();
                             if(d.plan === 'pro') proCount++;
                             const date = d.joined?.toDate ? d.joined.toDate().toLocaleDateString('it-IT') : 'N/A';
                             // SECURITY FIX C2: tutti i valori da Firestore passano per esc()
                             rows.push(`<tr><td>${esc(d.email||'—')}</td><td><span class="user-plan ${d.plan==='pro'?'pro':'free'}">${esc((d.plan||'free').toUpperCase())}</span></td><td>${esc(date)}</td></tr>`);
                         });
-                        // FIX: usa .size invece di .count().get() (non supportato in compat SDK v9)
                         const projSnap = await app.db.collection('projects').limit(500).get();
-                        document.getElementById('admin-users-count').textContent = usersSnap.size;
+                        document.getElementById('admin-users-count').textContent = truncated ? `${MAX_USERS}+` : String(usersSnap.size);
                         document.getElementById('admin-pro-count').textContent = proCount;
                         document.getElementById('admin-projects-count').textContent = projSnap.size;
                         document.getElementById('admin-users-list').innerHTML = rows.join('');
+                        if(truncated) app.toast.show(`Mostrati i primi ${MAX_USERS} utenti. Per dataset più grandi implementare la paginazione.`, 'warning');
                     } catch(e){ console.error(e); app.toast.show('Errore caricamento dati admin','error'); }
                 }
             },
@@ -1520,13 +1565,21 @@
                 // SECURITY FIX A1: il contatore è ora su Firestore, non più su localStorage.
                 // localStorage era bypassabile in 2 secondi dalla console del browser.
                 // La Security Rule su Firestore impedisce di decrementare o impostare valori arbitrari.
+                //
+                // ARCHITETTURA: separazione controllo (sincrono) vs aggiornamento (asincrono).
+                // Il controllo del limite usa la cache in-memory (_dailyCount) per rispondere
+                // immediatamente senza bloccare la UI. L'aggiornamento su Firestore avviene in
+                // background — il server è la fonte di verità, la cache è solo per la UX.
+                // La Security Rule garantisce che il client non possa scrivere valori arbitrari.
+                _dailyCount: null,   // cache locale del contatore {date, count}
+
                 async checkDailyLimit() {
                     if(app.state.get('isPro')) return true;
                     if(app.state.get('isAdmin')) return true; // admin: nessun limite
                     const user = app.state.get('user');
                     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD, timezone-agnostic
 
-                    // Utente non autenticato: fallback locale (non ha accesso a Firestore)
+                    // Utente non autenticato: fallback localStorage (non ha accesso a Firestore)
                     if(!user) {
                         const count = parseInt(localStorage.getItem(`sims_${today}`) || '0');
                         if(count >= CONFIG.maxFreeOps) {
@@ -1539,29 +1592,40 @@
                         return true;
                     }
 
-                    // Utente autenticato: verifica e incremento atomico su Firestore
-                    try {
-                        const userRef = app.db.collection('users').doc(user.uid);
-                        const doc = await userRef.get();
-                        if (!doc.exists) return true; // utente appena creato, permettiamo
+                    // Utente autenticato: verifica sincrona dalla cache, aggiornamento asincrono.
+                    // La cache viene azzerata ad ogni cambio di giorno o al login.
+                    const cache = app.access._dailyCount;
+                    let currentCount = (cache && cache.date === today) ? cache.count : 0;
 
-                        const ops = doc.data().dailyOps || {};
-                        const currentCount = ops.date === today ? (ops.count || 0) : 0;
-
-                        if (currentCount >= CONFIG.maxFreeOps) {
-                            app.toast.show(`Limite giornaliero raggiunto (${CONFIG.maxFreeOps} operazioni). Passa a PRO per operazioni illimitate.`, 'warning');
-                            app.upgrade.showModal();
-                            return false;
-                        }
-
-                        const newCount = currentCount + 1;
-                        await userRef.update({ dailyOps: { date: today, count: newCount } });
-                        app.ui.updateDailyCounter(newCount);
-                        return true;
-                    } catch(e) {
-                        console.warn('Daily limit Firestore check failed, allowing operation:', e);
-                        return true; // fail-open: non blocchiamo l'utente per un errore di rete
+                    if(currentCount >= CONFIG.maxFreeOps) {
+                        app.toast.show(`Limite giornaliero raggiunto (${CONFIG.maxFreeOps} operazioni). Passa a PRO per operazioni illimitate.`, 'warning');
+                        app.upgrade.showModal();
+                        return false;
                     }
+
+                    // Incrementa la cache localmente (risposta immediata alla UI)
+                    const newCount = currentCount + 1;
+                    app.access._dailyCount = { date: today, count: newCount };
+                    app.ui.updateDailyCounter(newCount);
+
+                    // Aggiorna Firestore in background — non blocca il calcolo.
+                    // La Security Rule validerà count == resource.data.dailyOps.count + 1 lato server.
+                    const userRef = app.db.collection('users').doc(user.uid);
+                    userRef.update({ dailyOps: { date: today, count: newCount } })
+                        .catch(e => {
+                            // In caso di errore (es. nuovo giorno, doc non esiste ancora)
+                            // ri-sincronizziamo dalla sorgente Firestore
+                            console.warn('dailyOps update failed, re-syncing:', e.code);
+                            userRef.get().then(doc => {
+                                if(!doc.exists) return;
+                                const ops = doc.data().dailyOps || {};
+                                const serverCount = ops.date === today ? (ops.count || 0) : 0;
+                                app.access._dailyCount = { date: today, count: serverCount };
+                                app.ui.updateDailyCounter(serverCount);
+                            }).catch(()=>{});
+                        });
+
+                    return true;
                 }
             }, // ← CHIUSURA CORRETTA di access
 
@@ -1571,11 +1635,15 @@
                 show(message, type='info', title='') {
                     const c=document.getElementById('toast-container');
                     if(!c) return;
+                    // CRIT-06 FIX: 'message' può contenere testo da errori Stripe o Firebase
+                    // che a loro volta riflettono input utente (es. nome campo non valido).
+                    // 'title' è passato da codice interno ma sanifichiamo comunque per difesa in profondità.
+                    const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
                     const t=document.createElement('div');
                     t.className=`toast ${type}`;
                     const icons={success:'fa-check-circle',error:'fa-circle-xmark',warning:'fa-triangle-exclamation',info:'fa-circle-info'};
                     const titles={success:'Successo',error:'Errore',warning:'Attenzione',info:'Info'};
-                    t.innerHTML=`<i class="fa-solid ${icons[type]||icons.info} toast-icon"></i><div class="toast-content"><div class="toast-title">${title||titles[type]}</div><div class="toast-message">${message}</div></div><button class="toast-close" onclick="this.parentElement.remove()"><i class="fa-solid fa-xmark"></i></button>`;
+                    t.innerHTML=`<i class="fa-solid ${icons[type]||icons.info} toast-icon"></i><div class="toast-content"><div class="toast-title">${esc(title||titles[type])}</div><div class="toast-message">${esc(message)}</div></div><button class="toast-close" onclick="this.parentElement.remove()"><i class="fa-solid fa-xmark"></i></button>`;
                     c.appendChild(t);
                     setTimeout(()=>{ t.classList.add('hiding'); setTimeout(()=>t.remove(),300); }, 4000);
                 }
