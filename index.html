@@ -11,7 +11,7 @@
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js" defer></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js" defer></script>
     <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js" defer></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
     <!-- SheetJS: generazione .xlsx nativa (non CSV mascherato) -->
@@ -1253,13 +1253,8 @@
                     lc.innerHTML='<div class="empty-state"><div class="skeleton" style="height:60px;margin-bottom:10px;"></div><div class="skeleton" style="height:60px;"></div></div>';
                     try {
                         const isAdmin=app.state.get('isAdmin');
-                        // where() prima di orderBy() è obbligatorio per query composte in Firestore.
-                        // L'ordine inverso causa 'failed-precondition' anche con l'indice corretto.
-                        // INDICE COMPOSITO RICHIESTO: projects | uid ASC + updatedAt DESC
-                        // Crearlo in Firebase Console → Firestore → Indici → Aggiungi indice composito.
-                        let q = isAdmin
-                            ? app.db.collection('projects').orderBy('updatedAt','desc')
-                            : app.db.collection('projects').where('uid','==',user.uid).orderBy('updatedAt','desc');
+                        let q=app.db.collection('projects').orderBy('updatedAt','desc');
+                        if(!isAdmin) q=q.where('uid','==',user.uid);
                         const snap=await q.get();
                         if(snap.empty){ lc.innerHTML='<div class="empty-state"><i class="fa-solid fa-folder-open"></i><p>Nessun progetto salvato</p></div>'; return; }
                         lc.innerHTML='';
@@ -1427,18 +1422,54 @@
                     const user=app.state.get('user');
                     if(!user){ app.toast.show('Devi effettuare il login','warning'); return; }
 
-                    // Cleanup eventuale listener precedente
                     app.upgrade._cleanupListener();
-
                     app.upgrade.selectedPlan=planType;
                     document.querySelectorAll('.plan-card').forEach(c=>c.classList.remove('selected'));
                     document.getElementById(`plan-${planType}`)?.classList.add('selected');
                     app.upgrade.updatePaymentUI();
-
                     app.ui.showPaymentStatus('processing','Connessione a Stripe in corso...');
 
                     try {
-                        // FIX #4: URL base calcolata correttamente
+                        // STRIPE stripeId FIX:
+                        // La Extension legge customers/{uid}.stripeId per creare la checkout_session.
+                        // Se il documento non esiste o esiste senza stripeId (utenti pre-Extension),
+                        // la Extension lancia "Cannot read properties of null (reading 'stripeId')".
+                        // Soluzione: verifica e attendi che stripeId sia disponibile prima di procedere.
+                        const custRef = app.db.collection('customers').doc(user.uid);
+                        const custSnap = await custRef.get();
+
+                        if(!custSnap.exists) {
+                            // Documento assente: crealo con solo {email} per triggerare la Extension.
+                            // La regola Firestore ora lo permette (allow create con solo 'email').
+                            app.ui.showPaymentStatus('processing','Configurazione account Stripe...');
+                            try { await custRef.set({ email: user.email }); } catch(e) { /* ignora se già esiste */ }
+                        }
+
+                        // Se stripeId non è ancora presente, attendi che la Extension lo aggiunga (max 15s).
+                        // La Extension popola stripeId quando processa il documento customers/{uid}.
+                        const hasStripeId = custSnap.exists && custSnap.data()?.stripeId;
+                        if(!hasStripeId) {
+                            app.ui.showPaymentStatus('processing','Attesa configurazione Stripe (può richiedere fino a 15s)...');
+                            const stripeReady = await new Promise(resolve => {
+                                let settled = false;
+                                const timeout = setTimeout(() => { if(!settled){ settled=true; unsub(); resolve(false); } }, 15000);
+                                const unsub = custRef.onSnapshot(snap => {
+                                    if(snap.exists && snap.data()?.stripeId && !settled) {
+                                        settled = true;
+                                        clearTimeout(timeout);
+                                        unsub();
+                                        resolve(true);
+                                    }
+                                });
+                            });
+                            if(!stripeReady) {
+                                app.ui.showPaymentStatus('error','Account Stripe non ancora configurato. Riprova tra 30 secondi o contatta il supporto.');
+                                app.toast.show('Configurazione Stripe in corso. Riprova tra qualche secondo.','warning');
+                                return;
+                            }
+                        }
+
+                        app.ui.showPaymentStatus('processing','Apertura checkout Stripe...');
                         const baseUrl=window.location.href.replace(/[^/]*$/, '');
                         const plan=CONFIG.stripe.plans[planType];
                         const sessionData={
@@ -1446,12 +1477,10 @@
                             success_url: baseUrl + 'success.html',
                             cancel_url: baseUrl + 'cancel.html'
                         };
-                        // Solo pagamenti one-time (Lifetime) richiedono mode: 'payment'
                         if(plan.mode==='payment') sessionData.mode='payment';
 
-                        const docRef=await app.db.collection('customers').doc(user.uid).collection('checkout_sessions').add(sessionData);
+                        const docRef=await custRef.collection('checkout_sessions').add(sessionData);
 
-                        // FIX #5: listener pulito e rimosso dopo redirect
                         app.upgrade._checkoutListener=docRef.onSnapshot(doc=>{
                             const data=doc.data();
                             if(!data) return;
