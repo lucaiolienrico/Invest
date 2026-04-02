@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="it" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Verifica attivazione piano PRO InvestPro dopo il completamento del pagamento Stripe.">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Conferma Pagamento | InvestPro</title>
+
+    <!--
+    =========================================================================
+    NOTE DI PRODUZIONE — SICUREZZA CDN
+    =========================================================================
+    Aggiungere integrity hash prima del deploy:
+      - Font Awesome: https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/
+      - Firebase 9.22.0: Google CDN non fornisce SRI; bundle via npm per produzione.
+    =========================================================================
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link
+        rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+        crossorigin="anonymous">
+
+    <!--
+    FIX PERF-01: aggiunto "defer" a tutti e tre gli script Firebase.
+    Senza defer, il browser blocca il parsing HTML e il primo render fino al
+    completamento del download (~250 KB) + esecuzione di tutti e tre gli SDK.
+    Con defer, gli script vengono scaricati in parallelo al parsing HTML ed
+    eseguiti nell'ordine dichiarato subito prima che DOMContentLoaded scatti,
+    garantendo la disponibilità degli SDK quando il codice applicativo parte.
+    -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js" defer></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js" defer></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js" defer></script>
+
+    <style>
+        /* ====================================================================
+           DESIGN TOKENS — allineati al sistema di index.html
+           ==================================================================== */
+        :root {
+            --bg-body:          #0f172a;
+            --bg-card:          #1e293b;
+            --primary:          #10b981;
+            --primary-hover:    #059669;
+            --warning:          #f59e0b;
+            --danger:           #ef4444;
+            --text-main:        #f8fafc;
+            --text-muted:       #94a3b8;
+            --text-inverse:     #0f172a;
+            --border:           #334155;
+            --radius-xl:        16px;
+            --radius-md:        8px;
+            --shadow-xl:        0 20px 25px -5px rgba(0, 0, 0, 0.6);
+            --transition-base:  250ms ease;
+        }
+
+        /* ====================================================================
+           RESET & BASE
+           ==================================================================== */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html { -webkit-font-smoothing: antialiased; }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-body);
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            line-height: 1.6;
+            padding: 1.5rem;
+        }
+
+        /* ====================================================================
+           CARD
+           ==================================================================== */
+        .success-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-xl);
+            padding: 3rem 2rem;
+            max-width: 450px;
+            width: 100%;
+            text-align: center;
+            box-shadow: var(--shadow-xl);
+            animation: slideUp 0.5s ease-out both;
+        }
+
+        /* ====================================================================
+           ICON
+           ==================================================================== */
+        .icon-container {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 1.5rem;
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+            transition: background var(--transition-base), border-color var(--transition-base);
+        }
+
+        /* Stato: verifica in corso (default) */
+        .icon-container .status-icon {
+            font-size: 2.5rem;
+            color: var(--warning);
+            transition: color var(--transition-base);
+        }
+
+        /* Stato: PRO confermato */
+        .icon-container.is-confirmed {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: rgba(16, 185, 129, 0.2);
+        }
+        .icon-container.is-confirmed .status-icon { color: var(--primary); }
+
+        /* Stato: timeout / errore */
+        .icon-container.is-warning {
+            background: rgba(245, 158, 11, 0.15);
+            border-color: rgba(245, 158, 11, 0.3);
+        }
+        .icon-container.is-warning .status-icon { color: var(--warning); }
+
+        /* ====================================================================
+           TYPOGRAPHY
+           ==================================================================== */
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 800;
+            color: var(--text-main);
+            margin-bottom: 0.75rem;
+            letter-spacing: -0.02em;
+            /* FIX: transizione di contenuto non animabile, ma il reflow è morbido */
+        }
+
+        p {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            margin-bottom: 2rem;
+            max-width: 340px;
+            margin-left: auto;
+            margin-right: auto;
+            transition: color var(--transition-base);
+        }
+
+        /* ====================================================================
+           STATUS BAR
+           FIX ACC-01: aggiunto aria-live="polite" via attributo HTML — i
+           cambiamenti dinamici di testo sono ora annunciati dagli screen reader.
+           ==================================================================== */
+        .status-bar {
+            border-radius: var(--radius-md);
+            padding: 0.75rem 1rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            justify-content: center;
+            /* Stato default: warning (attesa) */
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid var(--warning);
+            color: var(--warning);
+            transition: background var(--transition-base), border-color var(--transition-base), color var(--transition-base);
+        }
+
+        .status-bar.is-confirmed {
+            background: rgba(16, 185, 129, 0.1);
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        .status-bar.is-error {
+            background: rgba(245, 158, 11, 0.1);
+            border-color: var(--warning);
+            color: var(--warning);
+        }
+
+        /* ====================================================================
+           BUTTON
+           ==================================================================== */
+        .btn-primary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            width: 100%;
+            padding: 0.875rem 1.5rem;
+            background: var(--primary);
+            color: var(--text-inverse);
+            font-family: inherit;
+            font-weight: 700;
+            font-size: 0.95rem;
+            text-decoration: none;
+            border-radius: var(--radius-md);
+            border: none;
+            cursor: pointer;
+            transition: background var(--transition-base), transform var(--transition-base), box-shadow var(--transition-base), opacity var(--transition-base);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: var(--primary-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(16, 185, 129, 0.35);
+        }
+
+        .btn-primary:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 3px;
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        /* ====================================================================
+           REDIRECT COUNTDOWN
+           ==================================================================== */
+        .redirect-text {
+            display: block;
+            margin-top: 1.25rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .redirect-text .countdown-value {
+            font-weight: 700;
+            color: var(--text-main);
+        }
+
+        .redirect-text[hidden] { display: none; }
+
+        /* ====================================================================
+           ANIMATIONS
+           ==================================================================== */
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to   { transform: translateY(0);    opacity: 1; }
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50%       { transform: scale(1.05); }
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .icon-spinning {
+            display: inline-block;
+            animation: spin 1s linear infinite;
+        }
+
+        .icon-pulsing {
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+    </style>
+</head>
+<body>
+    <main aria-labelledby="page-title">
+        <div class="success-card">
+
+            <!--
+                FIX ACC-02: aria-hidden="true" su tutti i contenitori icona.
+                Le icone sono decorative — il significato è già espresso da
+                heading e testo. Lo screen reader deve annunciare solo quello.
+            -->
+            <div class="icon-container icon-pulsing" id="icon-wrapper" aria-hidden="true">
+                <i class="fa-solid fa-rotate icon-spinning status-icon" id="status-icon"></i>
+            </div>
+
+            <!--
+                FIX UX-01: titolo iniziale neutro "Verifica Pagamento"
+                invece di "Pagamento Ricevuto" — evita di comunicare
+                successo prima che la verifica Firebase sia completata.
+                Un utente che naviga direttamente a questa URL senza
+                aver pagato non viene ingannato.
+            -->
+            <h1 id="page-title">Verifica Pagamento</h1>
+            <p id="main-desc">
+                Sincronizzazione permessi PRO in corso.<br>
+                Non chiudere questa pagina.
+            </p>
+
+            <!--
+                FIX ACC-01: aria-live="polite" + role="status" comunicano
+                i cambiamenti di stato dinamici agli screen reader senza
+                interrompere la lettura in corso.
+            -->
+            <div
+                class="status-bar"
+                id="status-bar"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true">
+                <i class="fa-solid fa-rotate icon-spinning" aria-hidden="true"></i>
+                <span id="status-text">Attesa conferma da Stripe...</span>
+            </div>
+
+            <!--
+                FIX ACC-03: aria-disabled sincronizzato con disabled.
+                Alcuni screen reader non annunciano il cambiamento di stato
+                dell'attributo disabled nativo; aria-disabled è lo standard
+                per le tecnologie assistive.
+            -->
+            <button
+                class="btn-primary"
+                id="btn-dashboard"
+                disabled
+                aria-disabled="true">
+                <i class="fa-solid fa-chart-line" aria-hidden="true"></i>
+                Vai alla Dashboard
+            </button>
+
+            <!--
+                Usa hidden (attributo booleano HTML) invece di classe .hidden
+                per garantire compatibilità semantica con AT e display:none
+                applicato dal browser anche senza CSS.
+            -->
+            <span class="redirect-text" id="redirect-msg" hidden>
+                Reindirizzamento automatico tra
+                <span class="countdown-value" id="countdown">10</span> secondi...
+            </span>
+
+        </div>
+    </main>
+
+    <script>
+    /*
+     * FIX PERF-01: tutto il codice applicativo è racchiuso in DOMContentLoaded.
+     * Poiché gli SDK Firebase hanno defer, vengono eseguiti appena prima che
+     * DOMContentLoaded scatti — siamo certi che firebase.* sia disponibile
+     * quando questa callback parte.
+     */
+    document.addEventListener('DOMContentLoaded', function () {
+        'use strict';
+
+        // ====================================================================
+        // CONFIGURAZIONE FIREBASE
+        // Nota: questa configurazione è identica a quella di index.html.
+        // Per un'architettura multi-file, esternalizzare in un modulo ES condiviso
+        // (es. firebase-config.js) è la soluzione raccomandata. Nel contesto
+        // di un deploy statico senza bundler, la duplicazione è accettabile
+        // purché documentata e aggiornata in sincronia.
+        // ====================================================================
+        const FIREBASE_CONFIG = {
+            apiKey:            "AIzaSyDiGDvR2yXm0DE7vlJNGrIPQB0G-ntLHc0",
+            authDomain:        "analisimmobiliare-3b4a7.firebaseapp.com",
+            projectId:         "analisimmobiliare-3b4a7",
+            storageBucket:     "analisimmobiliare-3b4a7.firebasestorage.app",
+            messagingSenderId: "29979040948",
+            appId:             "1:29979040948:web:597ea331e06567d8d50be1"
+        };
+
+        // ====================================================================
+        // INIT FIREBASE
+        // ====================================================================
+        if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+        const db   = firebase.firestore();
+        const auth = firebase.auth();
+
+        // ====================================================================
+        // RIFERIMENTI DOM
+        // ====================================================================
+        const iconWrapper  = document.getElementById('icon-wrapper');
+        const statusIcon   = document.getElementById('status-icon');
+        const mainTitle    = document.getElementById('page-title');
+        const mainDesc     = document.getElementById('main-desc');
+        const statusBar    = document.getElementById('status-bar');
+        const statusText   = document.getElementById('status-text');
+        const btnDashboard = document.getElementById('btn-dashboard');
+        const redirectMsg  = document.getElementById('redirect-msg');
+        const countdownEl  = document.getElementById('countdown');
+
+        // ====================================================================
+        // STATO INTERNO
+        // FIX: due flag separati per due concetti distinti.
+        //   - confirmed: la verifica PRO è riuscita; onProConfirmed non deve
+        //     essere rieseguita anche se Firestore emette altri snapshot.
+        //   - redirected: la navigazione è partita; goToDashboard è no-op.
+        // ====================================================================
+        let confirmed            = false;
+        let redirected           = false;
+        let unsubscribeSnapshot  = null; // Firestore listener
+        let unsubscribeAuth      = null; // Auth state listener
+        let countdownTimer       = null;
+        let timeoutHandle        = null;
+
+        // ====================================================================
+        // UTILITY
+        // ====================================================================
+
+        /** Abilita il pulsante dashboard e rimuove aria-disabled. */
+        function enableButton() {
+            btnDashboard.disabled = false;
+            btnDashboard.removeAttribute('aria-disabled');
+        }
+
+        /** Ferma le animazioni sull'icona e aggiorna classe/icona. */
+        function setIconState(state) {
+            // Rimuovi tutte le classi di stato e animazioni
+            iconWrapper.classList.remove('icon-pulsing', 'is-confirmed', 'is-warning');
+            statusIcon.classList.remove('icon-spinning');
+
+            if (state === 'confirmed') {
+                iconWrapper.classList.add('is-confirmed');
+                statusIcon.className = 'fa-solid fa-check status-icon';
+            } else if (state === 'warning') {
+                iconWrapper.classList.add('is-warning');
+                statusIcon.className = 'fa-solid fa-triangle-exclamation status-icon';
+            }
+            // 'idle' → solo rimozione animazioni, nessuna classe aggiuntiva
+        }
+
+        // ====================================================================
+        // NAVIGAZIONE
+        // ====================================================================
+
+        /**
+         * Naviga alla dashboard.
+         * - window.location.replace: non aggiunge success.html alla history
+         *   del browser, evitando che il tasto "Indietro" riporti qui.
+         * - Pulizia obbligatoria di tutti i listener e timer prima del redirect
+         *   per prevenire callback su DOM rimosso.
+         */
+        function goToDashboard() {
+            if (redirected) return;
+            redirected = true;
+
+            if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
+            if (unsubscribeAuth)     { unsubscribeAuth();     unsubscribeAuth = null; }
+            clearInterval(countdownTimer);
+            clearTimeout(timeoutHandle);
+
+            window.location.replace('index.html');
+        }
+
+        // ====================================================================
+        // STATI UI
+        // ====================================================================
+
+        /**
+         * PRO confermato — aggiorna tutta la UI e avvia il countdown.
+         *
+         * FIX: flag 'confirmed' previene esecuzioni multiple in caso di
+         * snapshot multipli emessi da Firestore prima che unsubscribeSnapshot
+         * venga chiamato (race condition tra callback async e cleanup).
+         */
+        function onProConfirmed() {
+            if (confirmed) return;
+            confirmed = true;
+
+            if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
+            clearTimeout(timeoutHandle);
+
+            // Aggiorna icona
+            setIconState('confirmed');
+
+            // Aggiorna testi
+            mainTitle.textContent = 'Pagamento Confermato ✦';
+            mainDesc.textContent  = 'Il tuo account PRO è attivo. Accesso illimitato abilitato.';
+
+            // Aggiorna status bar — aria-live="polite" su #status-bar garantisce
+            // che lo screen reader annunci questo cambiamento al termine della
+            // lettura corrente.
+            statusBar.className = 'status-bar is-confirmed';
+            statusText.textContent = 'Account PRO attivato con successo';
+
+            // Abilita pulsante
+            enableButton();
+            // FIX: { once: true } — anche se onProConfirmed venisse chiamata due
+            // volte (difesa in profondità), il listener viene registrato una sola
+            // volta ed eseguito una sola volta.
+            btnDashboard.addEventListener('click', goToDashboard, { once: true });
+
+            // Avvia countdown
+            redirectMsg.removeAttribute('hidden');
+            let timeLeft = 10;
+            countdownEl.textContent = timeLeft;
+            countdownTimer = setInterval(() => {
+                timeLeft--;
+                countdownEl.textContent = timeLeft;
+                if (timeLeft <= 0) {
+                    clearInterval(countdownTimer);
+                    goToDashboard();
+                }
+            }, 1000);
+        }
+
+        /**
+         * Timeout scaduto — il webhook Stripe non ha ancora aggiornato Firestore.
+         * Non blocchiamo l'utente: indichiamo il ritardo e consentiamo il redirect
+         * manuale. Il piano PRO si attiverà entro 1-2 minuti.
+         *
+         * FIX UX-02: messaggio onesto che non implica errore di pagamento,
+         * solo ritardo nella propagazione del webhook.
+         */
+        function onTimeout() {
+            if (redirected || confirmed) return;
+
+            if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
+
+            setIconState('warning');
+
+            mainDesc.textContent = 'Il pagamento risulta ricevuto ma l\'attivazione PRO potrebbe richiedere 1-2 minuti. Torna alla dashboard e aggiorna la pagina.';
+
+            statusBar.className = 'status-bar is-error';
+            statusText.textContent = 'Sincronizzazione lenta — riprova tra qualche minuto';
+
+            enableButton();
+            btnDashboard.addEventListener('click', goToDashboard, { once: true });
+        }
+
+        // ====================================================================
+        // VERIFICA STATO PRO
+        // Tre check in cascata, coerenti con l'architettura di index.html:
+        //   1. Campo 'plan' nel documento users/{uid} (aggiornato dalla Extension)
+        //   2. Custom claim JWT 'stripeRole' (il più affidabile per subscription)
+        //   3. Collection payments/{} (fallback per pagamenti lifetime one-time)
+        // ====================================================================
+
+        /**
+         * Esegue tutti e tre i check PRO su un documento snapshot.
+         * Chiamata ad ogni aggiornamento del documento users/{uid}.
+         */
+        async function checkProStatus(user, docData) {
+            // Check 1: campo plan nel documento Firestore
+            if (docData && docData.plan === 'pro') {
+                onProConfirmed();
+                return true;
+            }
+
+            // Check 2: custom claim JWT — getIdTokenResult(true) forza il
+            // refresh del token, essenziale perché i custom claim sono
+            // aggiornati lato server dalla Stripe Extension e non sono
+            // immediatamente riflessi nel token in cache locale.
+            try {
+                const tokenResult = await user.getIdTokenResult(true);
+                if (tokenResult.claims.stripeRole === 'pro') {
+                    onProConfirmed();
+                    return true;
+                }
+            } catch (e) {
+                console.warn('Token claim check failed:', e);
+            }
+
+            // Check 3: pagamento lifetime one-time
+            try {
+                const payments = await db
+                    .collection('customers').doc(user.uid)
+                    .collection('payments')
+                    .where('status', '==', 'succeeded')
+                    .limit(1)
+                    .get();
+                if (!payments.empty) {
+                    onProConfirmed();
+                    return true;
+                }
+            } catch (e) {
+                console.warn('Payments check failed:', e);
+            }
+
+            return false;
+        }
+
+        // ====================================================================
+        // ENTRY POINT — Auth State Listener
+        //
+        // FIX: unsubscribeAuth salva il token di unsubscribe per pulirlo
+        // in goToDashboard(). Previene callback su stato utente dopo il
+        // redirect (edge case in SPA, meno critico in navigazione standard).
+        // ====================================================================
+        unsubscribeAuth = auth.onAuthStateChanged(async (user) => {
+            if (!user) {
+                // Nessuna sessione: non possiamo verificare nulla.
+                // Redirect immediato senza mostrare contenuto sensibile.
+                statusText.textContent = 'Nessuna sessione attiva — redirect in corso...';
+                setTimeout(goToDashboard, 2000);
+                return;
+            }
+
+            statusText.textContent = `Verifica per ${user.email}...`;
+
+            // Esegui un check iniziale immediato — il documento potrebbe essere
+            // già aggiornato prima che il listener Firestore emetta il primo snapshot.
+            try {
+                const snap = await db.collection('users').doc(user.uid).get();
+                if (snap.exists) {
+                    const alreadyPro = await checkProStatus(user, snap.data());
+                    if (alreadyPro) return; // confermato, listener non necessario
+                }
+            } catch (e) {
+                console.warn('Initial pro check failed:', e);
+            }
+
+            // Se non ancora confermato, ascolta Firestore in real-time.
+            // Ogni aggiornamento del documento users/{uid} riesegue i check.
+            unsubscribeSnapshot = db.collection('users').doc(user.uid).onSnapshot(
+                async (snap) => {
+                    if (!snap.exists || confirmed || redirected) return;
+                    await checkProStatus(user, snap.data());
+                },
+                (err) => {
+                    // Errore del listener (es. permission denied dopo logout)
+                    console.warn('Firestore snapshot error:', err);
+                }
+            );
+
+            // Timeout di sicurezza: 20 secondi.
+            // Copre il ritardo massimo tipico di propagazione webhook Stripe.
+            timeoutHandle = setTimeout(onTimeout, 20000);
+        });
+
+    }); // ← DOMContentLoaded
+    </script>
+</body>
+</html>

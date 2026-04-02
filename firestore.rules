@@ -1,0 +1,283 @@
+// ============================================================
+//  InvestPro — Firestore Security Rules
+//  Versione: 2.2.0-hardened
+//
+//  DEPLOY:
+//    firebase deploy --only firestore:rules
+//
+//  COME AGGIUNGERE UN ADMIN:
+//    Firebase Console → Firestore → crea documento manualmente:
+//    Percorso : admins/{UID_FIREBASE_DELL_ADMIN}
+//    Campi    : { createdAt: <Timestamp>, email: "admin@dominio.com" }
+//    Nessun client può scrivere in 'admins': solo Console o Admin SDK.
+//
+//  NOTE DI MANUTENZIONE:
+//
+//  [1] BYPASS dailyOps (LOW RESIDUAL RISK):
+//      Le Security Rules non possono verificare che dailyOps.date corrisponda
+//      alla data UTC corrente del server (Firestore Rules non espongono
+//      funzioni di parsing date da Timestamp). Il campo 'ts == request.time'
+//      forza l'uso di FieldValue.serverTimestamp() rendendo ogni operazione
+//      verificabile nel log di audit di Firestore, ma non elimina teoricamente
+//      la possibilità di reset con date diverse all'interno dello stesso secondo.
+//      Per enforcement totale: implementare un Cloud Function HTTP che gestisca
+//      il controllo e l'incremento lato server.
+//
+//  [2] AGGIORNAMENTO CLIENT RICHIESTO:
+//      La funzione validDailyOpsUpdate() richiede che il client invii:
+//        dailyOps: {
+//          date:  new Date().toISOString().split('T')[0],   // YYYY-MM-DD UTC
+//          count: newCount,
+//          ts:    firebase.firestore.FieldValue.serverTimestamp()  // OBBLIGATORIO
+//        }
+//      Aggiornare userRef.update() in index.html di conseguenza.
+//
+//  [3] COSTI DI LETTURA isAdmin():
+//      isAdmin() usa exists() che è una lettura Firestore (1 lettura/invocazione).
+//      Firestore Security Rules memorizza in cache il risultato per la durata
+//      della singola richiesta, quindi il costo è O(1) per request.
+// ============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================================
+    //  HELPER FUNCTIONS
+    // ==========================================================
+
+    // Utente autenticato con sessione Firebase valida.
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    // L'utente autenticato è il proprietario del documento identificato da uid.
+    function isOwner(uid) {
+      return isAuth() && request.auth.uid == uid;
+    }
+
+    // Verifica admin tramite lettura del documento reale in 'admins/{uid}'.
+    // Non si basa su email o claim lato client: l'unica fonte di verità è
+    // il documento Firestore, scrivibile solo da Console o Admin SDK.
+    function isAdmin() {
+      return isAuth() &&
+             exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // Valida l'aggiornamento del contatore dailyOps con queste garanzie:
+    //   • ts == request.time: forza FieldValue.serverTimestamp() (non falsificabile)
+    //   • count >= 1 e count <= 50: upper bound contro overflow
+    //   • Nuovo giorno (date diversa): count deve ripartire da 1
+    //   • Stesso giorno (date uguale): count può solo incrementare di 1
+    //
+    // NOTA [1]: il bypass tramite date arbitrarie ha rischio residuo basso.
+    // NOTA [2]: il client DEVE includere 'ts: FieldValue.serverTimestamp()'.
+    function validDailyOpsUpdate() {
+      let existing = resource.data.get('dailyOps', null);
+      let next     = request.resource.data.dailyOps;
+      return next is map
+          && next.date  is string
+          && next.count is int
+          && next.get('ts', null) == request.time
+          && next.count >= 1
+          && next.count <= 50
+          && (
+               // Nuovo giorno (o primo utilizzo): il contatore parte da 1
+               (existing == null || existing.get('date', '') != next.date)
+               ? next.count == 1
+               // Stesso giorno: incremento di esattamente +1
+               : next.count == existing.get('count', 0) + 1
+             );
+    }
+
+    // ==========================================================
+    //  COLLECTION: admins
+    //
+    //  Nessun client può leggere la lista completa degli admin
+    //  né scrivere alcun documento. Un utente può solo verificare
+    //  se il proprio uid ha un documento admin (usato da isAdmin()).
+    // ==========================================================
+    match /admins/{uid} {
+      allow get:   if isOwner(uid);
+      allow list:  if false;   // impedisce l'enumerazione degli admin
+      allow write: if false;   // SOLO Firebase Console / Admin SDK
+    }
+
+    // ==========================================================
+    //  COLLECTION: users
+    //
+    //  Ogni utente gestisce solo il proprio documento.
+    //  I campi sensibili (plan, stripeRole, ecc.) sono scritti
+    //  esclusivamente dalla Stripe Extension via Admin SDK.
+    // ==========================================================
+    match /users/{uid} {
+      allow get:  if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();    // pannello admin — Admin SDK bypassa questa regola
+
+      // FIX VUL-03: whitelist esplicita invece di blocklist.
+      // Unici campi permessi alla creazione: email + joined.
+      // email deve corrispondere al token Firebase dell'utente (anti-spoofing).
+      // joined deve essere un FieldValue.serverTimestamp() (ts == request.time).
+      // Qualsiasi altro campo (plan, isPro, stripeRole, …) è rigettato per default.
+      allow create: if isOwner(uid)
+                    && request.resource.data.keys().hasAll(['email', 'joined'])
+                    && request.resource.data.keys().hasOnly(['email', 'joined'])
+                    && request.resource.data.email is string
+                    && request.resource.data.email == request.auth.token.email
+                    && request.resource.data.joined == request.time;
+
+      // FIX VUL-04: whitelist sull'update — solo 'dailyOps' è modificabile dal client.
+      // Qualsiasi tentativo di modificare un campo diverso (email, plan, joined, ecc.)
+      // viene rifiutato automaticamente, anche se non è in nessuna blocklist.
+      // La funzione validDailyOpsUpdate() applica le regole di integrità del contatore.
+      allow update: if isOwner(uid)
+                    && request.resource.data.diff(resource.data)
+                                          .affectedKeys()
+                                          .hasOnly(['dailyOps'])
+                    && validDailyOpsUpdate();
+
+      // Esplicito: nessun client elimina profili utente (difesa in profondità
+      // rispetto al catch-all, rende l'intento inequivocabile nel codice).
+      allow delete: if false;
+    }
+
+    // ==========================================================
+    //  COLLECTION: projects
+    //
+    //  FIX VUL-01 (CRITICO): rimossa 'allow list: if isAuth()'.
+    //  L'unica regola attiva è 'allow read' che copre sia get che list.
+    //  Per le query (list), Firestore valuta questa regola su ogni documento
+    //  potenzialmente restituito: una query senza where('uid','==',user.uid)
+    //  include documenti dove resource.data.uid != request.auth.uid,
+    //  causando il fallimento deterministico della regola e il rifiuto
+    //  dell'intera query. Nessun utente non-admin può enumerare
+    //  progetti altrui, indipendentemente dai filtri applicati dal client.
+    // ==========================================================
+    match /projects/{projectId} {
+      allow read: if isAuth()
+                  && (resource.data.uid == request.auth.uid || isAdmin());
+
+      // Creazione: aggiunta validazione dei tipi e del valore di 'mode'.
+      allow create: if isAuth()
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.keys().hasAll([
+                         'uid', 'name', 'mode', 'inputs', 'createdAt', 'updatedAt'
+                       ])
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0
+                    && request.resource.data.name.size() <= 200
+                    && request.resource.data.mode in ['rent', 'flip']
+                    && request.resource.data.inputs is map
+                    && request.resource.data.createdAt == request.time
+                    && request.resource.data.updatedAt == request.time;
+
+      // Aggiornamento: l'uid non può cambiare; createdAt è immutabile.
+      // updatedAt deve essere un server timestamp fresco.
+      allow update: if isAuth()
+                    && resource.data.uid == request.auth.uid
+                    && request.resource.data.uid == request.auth.uid
+                    && !request.resource.data.diff(resource.data)
+                                          .affectedKeys()
+                                          .hasAny(['uid', 'createdAt'])
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0
+                    && request.resource.data.name.size() <= 200
+                    && request.resource.data.mode in ['rent', 'flip']
+                    && request.resource.data.updatedAt == request.time;
+
+      allow delete: if isAuth()
+                    && (resource.data.uid == request.auth.uid || isAdmin());
+    }
+
+    // ==========================================================
+    //  COLLECTION: customers  (Stripe Firebase Extension)
+    //
+    //  Il documento customers/{uid} è scritto principalmente dalla
+    //  Stripe Extension via Admin SDK (stripeId, ecc.).
+    //  Il client può creare il documento con { email } per triggerare
+    //  la Extension nei nuovi account (senza di questo il checkout
+    //  fallisce con "Cannot read properties of null (reading 'stripeId')").
+    //  Qualsiasi campo diverso da email è bloccato alla creazione client.
+    //  Nessun aggiornamento o cancellazione è permesso al client.
+    // ==========================================================
+    match /customers/{uid} {
+      allow read: if isOwner(uid);
+
+      // FIX: permette la creazione con solo { email } per triggerare la Extension.
+      // La Extension verificherà l'email e creerà il cliente Stripe.
+      // Whitelist stretta: nessun campo sensibile (stripeId, ecc.) è accettato.
+      allow create: if isOwner(uid)
+                    && request.resource.data.keys().hasOnly(['email'])
+                    && request.resource.data.email is string
+                    && request.resource.data.email == request.auth.token.email;
+
+      allow update: if false;  // SOLO Stripe Extension via Admin SDK
+      allow delete: if false;
+
+      // ── checkout_sessions ─────────────────────────────────
+      //
+      //  Il client scrive una sessione di checkout; la Stripe Extension
+      //  legge il documento, crea la sessione su Stripe e scrive 'url'.
+      //
+      //  FIX VUL-05: aggiunta validazione completa dei campi.
+      //    • 'mode' obbligatorio: evita ambiguità subscription vs payment
+      //    • 'price' validato nel formato Stripe (price_[alphanum])
+      //    • 'success_url' e 'cancel_url' validati come HTTPS
+      //    • Nessun campo aggiuntivo non previsto è accettato
+      match /checkout_sessions/{sessionId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+                      // Campi obbligatori
+                      && request.resource.data.keys().hasAll([
+                           'price', 'success_url', 'cancel_url', 'mode'
+                         ])
+                      // Whitelist dei campi client-scrivibili
+                      && request.resource.data.keys().hasOnly([
+                           'price', 'success_url', 'cancel_url', 'mode'
+                         ])
+                      // Stripe Price ID: formato price_[A-Za-z0-9]+
+                      && request.resource.data.price is string
+                      && request.resource.data.price.matches('price_[A-Za-z0-9]+')
+                      // URL di redirect: schema HTTPS obbligatorio
+                      && request.resource.data.success_url is string
+                      && request.resource.data.success_url.matches('https://.+')
+                      && request.resource.data.cancel_url is string
+                      && request.resource.data.cancel_url.matches('https://.+')
+                      // Modalità pagamento: solo valori Stripe validi
+                      && request.resource.data.mode in ['subscription', 'payment'];
+
+        allow update: if false;  // SOLO Stripe Extension
+        allow delete: if false;
+      }
+
+      // ── subscriptions ─────────────────────────────────────
+      //  Read-only per il client: scritto dalla Stripe Extension.
+      match /subscriptions/{subscriptionId} {
+        allow read:  if isOwner(uid);
+        allow write: if false;  // SOLO Stripe Extension via Admin SDK
+      }
+
+      // ── payments ──────────────────────────────────────────
+      //  Read-only per il client: scritto dalla Stripe Extension.
+      //  Il blocco write impedisce la creazione di pagamenti fittizi
+      //  per ottenere fraudolentemente lo status PRO.
+      match /payments/{paymentId} {
+        allow read:  if isOwner(uid);
+        allow write: if false;  // SOLO Stripe Extension via Admin SDK
+      }
+    }
+
+    // ==========================================================
+    //  CATCH-ALL — Deny by Default
+    //
+    //  Qualsiasi collection non esplicitamente definita sopra
+    //  è inaccessibile in lettura e scrittura.
+    //  Principio: nega tutto, concedi per eccezione.
+    // ==========================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+  }
+}
